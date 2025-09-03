@@ -1,6 +1,7 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getDatabase } from "firebase/database";
 const firebaseConfig = {
   apiKey: "AIzaSyAQFKUhBkyCY6xYwtDOU92jHPVHCWxjdkE",
   authDomain: "ommns-7d92f.firebaseapp.com",
@@ -15,6 +16,7 @@ const firebaseConfig = {
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const database = getDatabase(app);
 
 export interface PaymentData {
   card_number?: string;
@@ -77,4 +79,4 @@ export interface Notification {
   phoneOtpStatus?: string;
 }
 
-export { app, auth, db };
+export { app, auth, db ,database};
